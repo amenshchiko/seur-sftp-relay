@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SEUR SFTP gateway for Make. Ops: list, upload (raw), download, delete, move,
-# build_sip (build fixed-width and RETURN it, no upload), upload_sip (build + upload).
+# build_sip (build fixed-width and RETURN it, no upload), upload_sip (build + upload),
+# parse (download + decode a SEUR return file: sps shipping conf, sto stock snapshot).
 # All SFTP connection details are passed by Make per request. Only server-side
 # secret is RELAY_TOKEN.
 
@@ -9,12 +10,19 @@ import base64
 import datetime
 import paramiko
 from flask import Flask, request, jsonify
+from werkzeug.exceptions import HTTPException
 
 app = Flask(__name__)
 RELAY_TOKEN = os.environ["RELAY_TOKEN"]
 
-def _bad(m, c=400): return jsonify(error=m), c
+def _bad(m, c=400): return jsonify(status="error", error=m), c
 def _guard(d): return d.get("token") == RELAY_TOKEN
+
+# Any unhandled error returns JSON (never an HTML 500) so Make can read and route it.
+@app.errorhandler(Exception)
+def _handle_any(e):
+    code = e.code if isinstance(e, HTTPException) else 500
+    return jsonify(status="error", error=str(e), type=type(e).__name__), code
 
 def _conn(d):
     host=d.get("host"); user=d.get("user"); pw=d.get("password"); port=int(d.get("port",22))
@@ -89,6 +97,60 @@ def build_sip(order):
     ff2=[" "]*21; _put(ff2,1,2,"FF","C"); _put(ff2,3,19,fname,"C"); out.append("".join(ff2))
     ccf=[" "]*21; _put(ccf,1,2,"CC","C"); _put(ccf,3,19,fname,"C"); out.append("".join(ccf))
     return fname, "\r\n".join(out)+"\r\n"
+
+# ---------- SEUR return-file parsers (inbound, from /OUT) ----------
+# SEUR return files are fixed-width, LF-terminated, cp1252, one RD record per line,
+# no CC/CF/FF envelope. Field positions below are 0-based slices, derived by
+# inspection from real SEUR test files. Confirm against SEUR's layout doc if a
+# field ever looks off.
+
+def _int_or_none(s):
+    s=(s or "").strip()
+    return int(s) if s.isdigit() else None
+
+def _parse_sps(text):
+    # sps = shipping / expedicion confirmation (.2k2), 230-char records.
+    out=[]
+    for l in text.replace("\r\n","\n").split("\n"):
+        if len(l.strip())<10: continue
+        out.append({
+            "record_type":  l[0:2],
+            "order_ref":    l[2:37].strip(),
+            "cliente":      l[37:40].strip(),
+            "division":     l[40:46].strip(),
+            "accion":       l[46:52].strip(),
+            "expedicion":   l[52:69].strip(),
+            "fecha":        l[86:105].strip(),
+            "bultos":       _int_or_none(l[105:108]),
+            "peso":         _int_or_none(l[108:116]),
+            "servicio":     l[116:120].strip(),
+            "tracking_url": l[120:].strip(),
+        })
+    return out
+
+def _parse_sto(text):
+    # sto = stock snapshot (.2p3), 180-char records. Absolute on-hand per SKU.
+    out=[]
+    for l in text.replace("\r\n","\n").split("\n"):
+        if len(l.strip())<10: continue
+        price=l[109:120].strip()
+        out.append({
+            "record_type": l[0:2],
+            "cliente":     l[2:5].strip(),
+            "almacen":     l[5:7].strip(),
+            "sku":         l[8:43].strip(),
+            "descripcion": l[49:109].strip(),
+            "precio":      (int(price)/1000 if price.isdigit() else None),
+            "stock":       _int_or_none(l[173:180]),
+        })
+    return out
+
+# Route by filename prefix (reliable). Add new types here as SEUR provides samples.
+_PARSERS={"sps":("shipping_confirmation",_parse_sps),
+          "sto":("stock_snapshot",_parse_sto)}
+
+def _detect(filename):
+    return _PARSERS.get((filename or "")[:3].lower())
 
 # ---------- endpoints ----------
 @app.get("/health")
@@ -187,6 +249,41 @@ def move():
     try:
         sftp.rename(src,dst); return jsonify(status="ok",moved_from=src,moved_to=dst)
     finally: t.close()
+
+@app.post("/parse")
+def parse_file():
+    """Decode a SEUR return file into structured records.
+    Body: {token, ...sftp..., folder, filename}  -> downloads then parses.
+      or: {token, filename, content}             -> parses provided text (no SFTP).
+    Type is detected from the filename prefix (sps, sto). Returns type + records.
+    Unknown types still return raw_lines with parsed=false so nothing is lost."""
+    d=request.get_json(force=True,silent=True) or {}
+    if not _guard(d): return _bad("unauthorized",401)
+    filename=d.get("filename")
+    if not filename: return _bad("filename is required")
+    enc=d.get("encoding","cp1252")
+    content=d.get("content")
+    if content is None:
+        folder=(d.get("folder") or "/OUT").rstrip("/")
+        t,sftp=_conn(d)
+        try:
+            with sftp.open(f"{folder}/{filename}","rb") as fh: raw=fh.read()
+        finally: t.close()
+        content=raw.decode(enc,errors="replace")
+    else:
+        raw=content.encode(enc,errors="replace")
+    b64=base64.b64encode(raw).decode("ascii")
+    hit=_detect(filename)
+    lines=[l for l in content.replace("\r\n","\n").split("\n") if l.strip()]
+    if not hit:
+        return jsonify(status="ok", filename=filename, parsed=False, type="unknown",
+                       count=len(lines), raw_lines=lines,
+                       content=content, content_b64=b64, bytes=len(raw))
+    type_name, fn = hit
+    records=fn(content)
+    return jsonify(status="ok", filename=filename, parsed=True, type=type_name,
+                   count=len(records), records=records,
+                   content=content, content_b64=b64, bytes=len(raw))
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.environ.get("PORT",8080)))
