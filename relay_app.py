@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SEUR SFTP gateway for Make. Ops: list, upload (raw), download, delete, move,
 # build_sip (build fixed-width and RETURN it, no upload), upload_sip (build + upload),
-# parse (download + decode a SEUR return file: sps shipping conf, sto stock snapshot).
+# parse (download + decode a SEUR return file: cps shipping conf, sto stock snapshot).
 # All SFTP connection details are passed by Make per request. Only server-side
 # secret is RELAY_TOKEN.
 
@@ -99,54 +99,100 @@ def build_sip(order):
     return fname, "\r\n".join(out)+"\r\n"
 
 # ---------- SEUR return-file parsers (inbound, from /OUT) ----------
-# SEUR return files are fixed-width, LF-terminated, cp1252, one RD record per line,
-# no CC/CF/FF envelope. Field positions below are 0-based slices, derived by
-# inspection from real SEUR test files. Confirm against SEUR's layout doc if a
-# field ever looks off.
+# SEUR return files are fixed-width, cp1252, RD data records only (NO CC/CF/FF
+# envelope on SEUR->BIOXY files). Field positions below are 0-based slices aligned
+# to "SISLOG - Manual de Integracion v11.00" (sheets "10 C. Salidas" and "7.1 Stock").
+# NOTE: no real SEUR return file has been received yet (OLD/ holds only our outbound
+# sip). These offsets are per the manual and MUST be validated byte-for-byte against
+# the first real cps/sto file during hypercare. /parse always returns `content` and
+# `content_b64`, so raw bytes are available to re-tune offsets without data loss.
 
 def _int_or_none(s):
     s=(s or "").strip()
     return int(s) if s.isdigit() else None
 
-def _parse_sps(text):
-    # sps = shipping / expedicion confirmation (.2k2), 230-char records.
-    out=[]
+def _tracking_url(order_ref):
+    # SEUR does NOT send a tracking URL in cps. Per the SISLOG KEY RULE the customer
+    # tracking link is derived from our order number.
+    return f"https://www.seur.com/miseur/mis-envios/?code={order_ref}" if order_ref else ""
+
+def _parse_cps(text):
+    # cps = Confirmacion lineas pedidos salida (SEUR -> BIOXY), file cps*.2m9,
+    # protocol 209/22. Manual sheet "10 C. Salidas". RD records only; LINE-LEVEL
+    # (one RD per order line, Reg 1 len 174) plus optional Reg 2 lote records
+    # (shorter, ~len 108). We aggregate the Reg 1 lines into ONE shipment per order.
+    # cps carries NO bultos/peso/servicio and NO tracking URL (derived below).
+    orders={}; seq=[]
     for l in text.replace("\r\n","\n").split("\n"):
-        if len(l.strip())<10: continue
-        out.append({
-            "record_type":  l[0:2],
-            "order_ref":    l[2:37].strip(),
-            "cliente":      l[37:40].strip(),
-            "division":     l[40:46].strip(),
-            "accion":       l[46:52].strip(),
-            "expedicion":   l[52:69].strip(),
-            "fecha":        l[86:105].strip(),
-            "bultos":       _int_or_none(l[105:108]),
-            "peso":         _int_or_none(l[108:116]),
-            "servicio":     l[116:120].strip(),
-            "tracking_url": l[120:].strip(),
+        if l[0:2]!="RD": continue
+        if len(l)<124: continue            # skip Reg 2 lote / short lines
+        order_ref=l[2:37].strip()
+        if not order_ref: continue
+        ref_cli=l[124:174].strip()         # Referencia Cliente = expedition ref
+        servida=_int_or_none(l[115:124])   # Cantidad Servida
+        if order_ref not in orders:
+            orders[order_ref]={
+                "order_ref":        order_ref,
+                "almacen":          l[40:43].strip(),
+                "fecha_salida":     l[87:106].strip(),   # DD-MM-YYYY HH:MM:SS
+                "expedicion":       ref_cli,
+                "bultos":           None,
+                "peso":             None,
+                "servicio":         None,
+                "tracking_url":     _tracking_url(order_ref),
+                "cantidad_servida": 0,
+                "lines":            [],
+            }
+            seq.append(order_ref)
+        o=orders[order_ref]
+        if not o["expedicion"] and ref_cli: o["expedicion"]=ref_cli
+        if servida: o["cantidad_servida"]+=servida
+        o["lines"].append({
+            "linea":            l[43:46].strip(),
+            "sku":              l[46:81].strip(),
+            "cantidad_pedida":  _int_or_none(l[106:115]),
+            "cantidad_servida": servida,
         })
-    return out
+    return [orders[k] for k in seq]
 
 def _parse_sto(text):
-    # sto = stock snapshot (.2p3), 180-char records. Absolute on-hand per SKU.
+    # sto = Stock (SEUR -> BIOXY), file sto*.2c3 (203/10 art+lote) or *.2p3 (203/16
+    # consolidated). Manual sheet "7.1 Stock", Reg len 180, RD records only.
+    # Available = Fisico - Pendiente - Reservado - Bloqueado.
+    # In .2c3 there is one article-level record (lote blank) plus per-lote records;
+    # consumers should use article-level rows (lote == "") to avoid double counting.
     out=[]
     for l in text.replace("\r\n","\n").split("\n"):
-        if len(l.strip())<10: continue
-        price=l[109:120].strip()
+        if l[0:2]!="RD": continue
+        if len(l)<172: continue
+        fisico   =_int_or_none(l[109:118])
+        pendiente=_int_or_none(l[118:127])
+        reservado=_int_or_none(l[127:136])
+        bloqueado=_int_or_none(l[163:172])
+        precio=l[172:180].strip()
+        disp=None
+        if fisico is not None:
+            disp=fisico-(pendiente or 0)-(reservado or 0)-(bloqueado or 0)
         out.append({
             "record_type": l[0:2],
             "cliente":     l[2:5].strip(),
-            "almacen":     l[5:7].strip(),
+            "almacen":     l[5:8].strip(),
             "sku":         l[8:43].strip(),
-            "descripcion": l[49:109].strip(),
-            "precio":      (int(price)/1000 if price.isdigit() else None),
-            "stock":       _int_or_none(l[173:180]),
+            "descripcion": l[49:89].strip(),
+            "lote":        l[89:109].strip(),
+            "fisico":      fisico,
+            "pendiente":   pendiente,
+            "reservado":   reservado,
+            "bloqueado":   bloqueado,
+            "disponible":  disp,
+            "stock":       disp,
+            "precio":      (int(precio)/1000 if precio.isdigit() else None),
         })
     return out
 
-# Route by filename prefix (reliable). Add new types here as SEUR provides samples.
-_PARSERS={"sps":("shipping_confirmation",_parse_sps),
+# Route by filename prefix. cps (and legacy alias sps) -> shipping, sto -> stock.
+_PARSERS={"cps":("shipping_confirmation",_parse_cps),
+          "sps":("shipping_confirmation",_parse_cps),
           "sto":("stock_snapshot",_parse_sto)}
 
 def _detect(filename):
@@ -255,7 +301,7 @@ def parse_file():
     """Decode a SEUR return file into structured records.
     Body: {token, ...sftp..., folder, filename}  -> downloads then parses.
       or: {token, filename, content}             -> parses provided text (no SFTP).
-    Type is detected from the filename prefix (sps, sto). Returns type + records.
+    Type is detected from the filename prefix (cps, sto). Returns type + records.
     Unknown types still return raw_lines with parsed=false so nothing is lost."""
     d=request.get_json(force=True,silent=True) or {}
     if not _guard(d): return _bad("unauthorized",401)
