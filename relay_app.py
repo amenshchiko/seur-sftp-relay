@@ -74,7 +74,10 @@ def build_sip(order):
     _put(h,614,3,"01","C"); _put(h,617,5,"40","C"); _put(h,647,1,"P","C")
     _put(h,648,60,order.get("notes",""),"C")
     _put(h,758,2,"N","C"); _put(h,1042,100,order.get("email",""),"C")
-    # Canal Mail (2422) and Canal SMS (2423): left BLANK per SEUR (2026-08).
+    # Canal Mail (2422) and Canal SMS (2423): left BLANK on purpose. SEUR activates
+    # the customer email/SMS notifications automatically at the action level in their
+    # own system (confirmed by SIL / Ana, 2026-10-06), so these must NOT be marked in
+    # the sip. Marking them with S/N previously caused file rejections.
     for pos,ln in HEADER_ZERO: _put(h,pos,ln,"0","N")
     header="".join(h)
     lines=[]
@@ -190,9 +193,31 @@ def _parse_sto(text):
         })
     return out
 
-# Route by filename prefix. cps (and legacy alias sps) -> shipping, sto -> stock.
+def _parse_sps(text):
+    # sps = Situacion de pedidos (SEUR -> BIOXY), file sps*.2k2, 230-char RD records.
+    # One record per order per status snapshot. Offsets validated against real SEUR
+    # files (2026-10). Carries the transport EXPEDITION number (pos 77, len 10),
+    # the status code (e.g. T028), and the full customer tracking URL.
+    out=[]
+    for l in text.replace("\r\n","\n").split("\n"):
+        if l[:2]!="RD": continue
+        if len(l)<120: continue
+        ui=l.find("https")
+        out.append({
+            "record_type":  l[0:2],
+            "order_ref":    l[2:37].strip(),
+            "cliente":      l[37:40].strip(),
+            "expedicion":   l[76:86].strip(),
+            "fecha_estado": l[86:105].strip(),
+            "status_code":  l[116:120].strip(),
+            "tracking_url": (l[ui:].strip() if ui!=-1 else ""),
+        })
+    return out
+
+# Route by filename prefix. cps -> units confirmed, sps -> status/expedition/tracking,
+# sto -> stock snapshot.
 _PARSERS={"cps":("shipping_confirmation",_parse_cps),
-          "sps":("shipping_confirmation",_parse_cps),
+          "sps":("order_status",_parse_sps),
           "sto":("stock_snapshot",_parse_sto)}
 
 def _detect(filename):
